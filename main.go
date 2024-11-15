@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,8 +23,9 @@ import (
 	"unicode"
 
 	"github.com/russross/blackfriday/v2"
-	"k8s.io/gengo/parser"
-	"k8s.io/gengo/types"
+	"k8s.io/gengo/v2"
+	"k8s.io/gengo/v2/parser"
+	"k8s.io/gengo/v2/types"
 	"k8s.io/klog/v2"
 )
 
@@ -31,9 +33,13 @@ var (
 	flConfig      = flag.String("config", "", "path to config file")
 	flAPIDir      = flag.String("api-dir", "", "api directory (or import path), point this to pkg/apis")
 	flTemplateDir = flag.String("template-dir", "template", "path to template/ dir")
+	flVersion     = flag.Bool("version", false, "print version and exit")
 
 	flHTTPAddr = flag.String("http-addr", "", "start an HTTP server on specified addr to view the result (e.g. :8080)")
 	flOutFile  = flag.String("out-file", "", "path to output file to save the result")
+
+	// set by go build
+	version string
 )
 
 const (
@@ -83,6 +89,14 @@ func init() {
 	flag.Set("alsologtostderr", "true") // for klog
 	flag.Parse()
 
+	commitHash, commitTime, dirtyBuild := getBuildInfo()
+	arch := fmt.Sprintf("%v/%v", runtime.GOOS, runtime.GOARCH)
+
+	if *flVersion {
+		fmt.Printf("gen-crd-api-reference-docs version=%s commit=%s date=%s dirty=%v arch=%s go=%v\n", version, commitHash, commitTime, dirtyBuild, arch, runtime.Version())
+		os.Exit(0)
+	}
+
 	if *flConfig == "" {
 		panic("-config not specified")
 	}
@@ -98,7 +112,6 @@ func init() {
 	if err := resolveTemplateDir(*flTemplateDir); err != nil {
 		panic(err)
 	}
-
 }
 
 func resolveTemplateDir(dir string) error {
@@ -156,14 +169,14 @@ func main() {
 
 	if *flOutFile != "" {
 		dir := filepath.Dir(*flOutFile)
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			klog.Fatalf("failed to create dir %s: %v", dir, err)
 		}
 		s, err := mkOutput()
 		if err != nil {
 			klog.Fatalf("failed: %+v", err)
 		}
-		if err := ioutil.WriteFile(*flOutFile, []byte(s), 0644); err != nil {
+		if err := os.WriteFile(*flOutFile, []byte(s), 0o644); err != nil {
 			klog.Fatalf("failed to write to out file: %v", err)
 		}
 		klog.Infof("written to %s", *flOutFile)
@@ -191,7 +204,7 @@ func main() {
 // groupName extracts the "//+groupName" meta-comment from the specified
 // package's comments, or returns empty string if it cannot be found.
 func groupName(pkg *types.Package) string {
-	m := types.ExtractCommentTags("+", pkg.Comments)
+	m := gengo.ExtractCommentTags("+", pkg.Comments)
 	v := m["groupName"]
 	if len(v) == 1 {
 		return v[0]
@@ -200,38 +213,42 @@ func groupName(pkg *types.Package) string {
 }
 
 func parseAPIPackages(dir string) ([]*types.Package, error) {
-	b := parser.New()
-	// the following will silently fail (turn on -v=4 to see logs)
-	if err := b.AddDirRecursive(*flAPIDir); err != nil {
-		return nil, err
+	p := parser.New()
+
+	pkgsFound, errFind := p.FindPackages(dir + "/...")
+	if errFind != nil {
+		return nil, fmt.Errorf("failed to find packages in %s: %w", dir, errFind)
 	}
-	scan, err := b.FindTypes()
+	klog.Infof("found %d packages", len(pkgsFound))
+
+	errLoad := p.LoadPackages(pkgsFound...)
+	if errLoad != nil {
+		return nil, fmt.Errorf("failed to load packages: %w", errLoad)
+	}
+
+	scan, err := p.NewUniverse()
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse pkgs and types: %w", err)
 	}
-	var pkgNames []string
-	for p := range scan {
-		pkg := scan[p]
+
+	var pkgs []*types.Package
+	for _, pkg := range scan {
+
 		klog.V(3).Infof("trying package=%v groupName=%s", p, groupName(pkg))
 
 		// Do not pick up packages that are in vendor/ as API packages. (This
 		// happened in knative/eventing-sources/vendor/..., where a package
 		// matched the pattern, but it didn't have a compatible import path).
 		if isVendorPackage(pkg) {
-			klog.V(3).Infof("package=%v coming from vendor/, ignoring.", p)
+			klog.V(3).Infof("package=%v coming from vendor/, ignoring.", pkg.Name)
 			continue
 		}
 
 		if groupName(pkg) != "" && len(pkg.Types) > 0 || containsString(pkg.DocComments, docCommentForceIncludes) {
-			klog.V(3).Infof("package=%v has groupName and has types", p)
-			pkgNames = append(pkgNames, p)
+			klog.V(3).Infof("package=%v has groupName and has types", pkg.Name)
+			klog.Info("using package=", pkg.Name)
+			pkgs = append(pkgs, pkg)
 		}
-	}
-	sort.Strings(pkgNames)
-	var pkgs []*types.Package
-	for _, p := range pkgNames {
-		klog.Infof("using package=%s", p)
-		pkgs = append(pkgs, scan[p])
 	}
 	return pkgs, nil
 }
@@ -302,7 +319,7 @@ func combineAPIPackages(pkgs []*types.Package) ([]*apiPackage, error) {
 // isVendorPackage determines if package is coming from vendor/ dir.
 func isVendorPackage(pkg *types.Package) bool {
 	vendorPattern := string(os.PathSeparator) + "vendor" + string(os.PathSeparator)
-	return strings.Contains(pkg.SourcePath, vendorPattern)
+	return strings.Contains(pkg.Dir, vendorPattern)
 }
 
 func findTypeReferences(pkgs []*apiPackage) map[*types.Type][]*types.Type {
@@ -404,7 +421,7 @@ func linkForType(t *types.Type, c generatorConfig, typePkgMap map[*types.Type]*a
 		return "#" + anchorIDForLocalType(t, typePkgMap), nil
 	}
 
-	var arrIndex = func(a []string, i int) string {
+	arrIndex := func(a []string, i int) string {
 		return a[(len(a)+i)%len(a)]
 	}
 
@@ -473,21 +490,28 @@ func typeDisplayName(t *types.Type, c generatorConfig, typePkgMap map[*types.Typ
 		s = tryDereference(t).Name.Name
 	}
 
-	if t.Kind == types.Pointer {
-		s = strings.TrimLeft(s, "*")
-	}
-
 	switch t.Kind {
 	case types.Struct,
 		types.Interface,
 		types.Alias,
-		types.Pointer,
-		types.Slice,
 		types.Builtin:
 		// noop
+
+	case types.Pointer:
+		// Use the display name of the element of the pointer as the display name of the pointer.
+		return typeDisplayName(t.Elem, c, typePkgMap)
+
+	case types.Slice:
+		// Use the display name of the element of the slice to build the display name of the slice.
+		elemName := typeDisplayName(t.Elem, c, typePkgMap)
+		return fmt.Sprintf("[]%s", elemName)
+
 	case types.Map:
-		// return original name
-		return t.Name.Name
+		// Use the display names of the key and element types of the map to build the display name of the map.
+		keyName := typeDisplayName(t.Key, c, typePkgMap)
+		elemName := typeDisplayName(t.Elem, c, typePkgMap)
+		return fmt.Sprintf("map[%s]%s", keyName, elemName)
+
 	case types.DeclarationOf:
 		// For constants, we want to display the value
 		// rather than the name of the constant, since the
@@ -502,7 +526,9 @@ func typeDisplayName(t *types.Type, c generatorConfig, typePkgMap map[*types.Typ
 
 			return *t.ConstValue
 		}
+
 		klog.Fatalf("type %s is a non-const declaration, which is unhandled", t.Name)
+
 	default:
 		klog.Fatalf("type %s has kind=%v which is unhandled", t.Name, t.Kind)
 	}
@@ -512,10 +538,6 @@ func typeDisplayName(t *types.Type, c generatorConfig, typePkgMap map[*types.Typ
 		if strings.HasPrefix(s, prefix) {
 			s = strings.Replace(s, prefix, replacement, 1)
 		}
-	}
-
-	if t.Kind == types.Slice {
-		s = "[]" + s
 	}
 
 	return s
@@ -591,7 +613,7 @@ func filterCommentTags(comments []string) []string {
 }
 
 func isOptionalMember(m types.Member) bool {
-	tags := types.ExtractCommentTags("+", m.CommentLines)
+	tags := gengo.ExtractCommentTags("+", m.CommentLines)
 	_, ok := tags["optional"]
 	return ok
 }
@@ -663,7 +685,7 @@ func render(w io.Writer, pkgs []*apiPackage, config generatorConfig) error {
 		"apiGroup":           func(t *types.Type) string { return apiGroupForType(t, typePkgMap) },
 		"packageAnchorID": func(p *apiPackage) string {
 			// TODO(ahmetb): currently this is the same as packageDisplayName
-			// func, and it's fine since it retuns valid DOM id strings like
+			// func, and it's fine since it returns valid DOM id strings like
 			// 'serving.knative.dev/v1alpha1' which is valid per HTML5, except
 			// spaces, so just trim those.
 			return strings.Replace(p.identifier(), " ", "", -1)
@@ -703,4 +725,24 @@ func render(w io.Writer, pkgs []*apiPackage, config generatorConfig) error {
 	}
 
 	return nil
+}
+
+func getBuildInfo() (string, string, bool) {
+	var commitHash, commitTime string
+	var dirtyBuild bool
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "", "", false
+	}
+	for _, kv := range info.Settings {
+		switch kv.Key {
+		case "vcs.revision":
+			commitHash = kv.Value
+		case "vcs.time":
+			commitTime = kv.Value
+		case "vcs.modified":
+			dirtyBuild = kv.Value == "true"
+		}
+	}
+	return commitHash, commitTime, dirtyBuild
 }
